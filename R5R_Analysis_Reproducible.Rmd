@@ -1,0 +1,666 @@
+---
+title: "R5R_Analysis"
+author: "Matthew Martignoni"
+date: "2023-06-29"
+output: html_document
+---
+# Setting Up for R5R: POIs and Centroids
+
+## Libraries
+```{r setup, include=FALSE}
+
+library(r5r)
+library(accessibility)
+library(sf)
+library(data.table)
+library(ggplot2)
+
+options(java.parameters = '-Xmx15G')
+
+library(spatstat)
+library(here)
+library(sp)
+library(rgeos)
+library(maptools)
+library(tmap)
+library(sf)
+library(geojson)
+library(geojsonio)
+library(tmaptools)
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(tmaptools)
+library(leafpop)
+library(leaflet)
+library(readr)
+library(janitor)
+library(dplyr)
+library(grid)
+library(OpenStreetMap)
+library(raster)
+library(fpc)
+library(dbscan)
+library(ggplot2)
+library(RSQLite)
+library(rgdal)
+library(terra)
+library(RColorBrewer)
+library(spdep)
+library(lubridate)
+library(zoo)
+library(viridis)
+library(ggplot2)
+library(dplyr)
+library(plotly)
+library(hrbrthemes)
+library(tools)
+library(UK2GTFS)
+```
+
+## Preprocessing
+This section reads in and formats the POI Data and Shapefiles; Subsetting the UK-Wide Shapefiles to focus on London. It includes the POI types used for this dissertation's case studies as well as others in case modelling different POIs are of interest.
+
+CSVs
+```{r}
+# List of CSV file paths
+csv_files <- c("YOUR_PATH_HERE/Attractions.csv",
+               "YOUR_PATH_HERE/Eating.csv",
+               "YOUR_PATH_HERE/Education.csv",
+               "YOUR_PATH_HERE/Entertainment.csv",
+               "YOUR_PATH_HERE/Government.csv",
+               "YOUR_PATH_HERE/Grocery.csv",
+               "YOUR_PATH_HERE/Health.csv",
+               "YOUR_PATH_HERE/Infrastructure.csv",
+               "YOUR_PATH_HERE/Organisations.csv",
+               "YOUR_PATH_HERE/Retail.csv",
+               "YOUR_PATH_HERE/Transport.csv")
+
+
+category_names <- c("Attractions", "Eating", "Education", "Entertainment", "Government",
+                    "Grocery", "Health", "Infrustructure", "Organisations", "Retail","Transport")
+
+```
+
+Shapefiles and Subsetting
+```{r}
+# Define the file path to the London shapefile
+uk_shapefile <- "YOUR_PATH_HERE/LSOA_2021_EW_BGC.shp"
+
+# Read the 'lsoas2021' shapefile
+lsoas2021 <- st_read(uk_shapefile)
+
+# List of London boroughs
+london_boroughs <- c("Barking and Dagenham", "Barnet", "Bexley", "Brent", "Bromley", "Camden", "City of London", "Croydon", "Ealing", "Enfield", "Greenwich", "Hackney", "Hammersmith and Fulham", "Haringey", "Harrow", "Havering", "Hillingdon", "Hounslow", "Islington", "Kensington and Chelsea", "Kingston upon Thames", "Lambeth", "Lewisham", "Merton", "Newham", "Redbridge", "Richmond upon Thames", "Southwark", "Sutton", "Tower Hamlets", "Waltham Forest", "Wandsworth", "Westminster")
+
+# Subset the 'lsoas2021' shapefile by borough names - this is because otherwise we have the entire UK shapefile
+london_boundary <- lsoas2021[grepl(paste(london_boroughs, collapse = "|"), lsoas2021$LSOA21NM), ]
+london_boundary <- london_boundary[!grepl("Brentwood", london_boundary$LSOA21NM), ]
+
+london_boundary <- st_make_valid(london_boundary)
+```
+
+Greenspace Shapefile - Turn it into Point Data / Centroids of Green Spaces 
+This section aims to create a CSV of green space centroid locations to treat as POIs. This can serve as another set of POIs if the modeller is interested.
+
+```{r}
+
+# Read in Greenspace Shapefiles from the Ordinance Survey
+green <- st_read("YOUR_PATH_HERE/open-greenspace_5109256/GB_GreenspaceSite.shp")
+
+#Subset to London
+green_london <- st_intersection(green, london_boundary)
+
+# Filter out polygons that do not intersect the London boundary
+green_london <- green_london[!is.na(st_geometry(green_london)), ]
+
+# Get the centroids of the greenspaces so I can use them as POIs
+centroids_green <- st_centroid(st_geometry(green_london))
+
+# Transform the centroids to WGS84 (EPSG:4326)
+centroids_green <- st_transform(centroids_green, crs = 4326)
+
+# Add the centroid coordinates to the centroids data frame
+# https://www.rdocumentation.org/packages/base/versions/3.6.2/topics/cbind
+
+centroids_green_data <- cbind(green_london, centroid_lat = st_coordinates(centroids_green)[, 2], centroid_lon = st_coordinates(centroids_green)[, 1])
+
+# Drop the geometry column - geometry isn't necessary for the csv, just need the lat and lon and we'll turn into a sf later
+centroids_green_data <- st_drop_geometry(centroids_green_data)
+
+# Save LSOA centroid data and POI data to csv files
+write.csv(centroids_green_data, file = "YOUR_PATH_HERE/Greenspace.csv")
+```
+
+Finally read in all the POIs, including Greenspaces
+```{r}
+# Initialise an empty list to store the data frames
+data_list <- list()
+
+# Loop through each CSV file
+for (i in seq_along(csv_files)) {
+  csv_file <- csv_files[i]
+  category <- category_names[i]
+  
+  #Read in the CSVs, the CSVs are not separated by a comma but rather a "|"
+  data <- read.csv(csv_file, sep = "|", stringsAsFactors = FALSE)
+  
+  #Add a new column called category so we can sort them more easily later
+  data$category <- category
+  
+  #Assign the df to the specified name
+  assign(category, data)
+  
+  #Add new df to the list
+  data_list[[category]] <- data}
+
+# Combine all dfs into one df of all POIs
+POIs <- do.call(rbind, data_list)
+
+# Read in the Greenspace CSV file
+Greenspaces <- read.csv("YOUR_PATH_HERE/Greenspace.csv")
+```
+
+## POIs & LSOA centroids
+
+As BNG uses Easting/Northing, this needs to be adapted because r5r requires longitude/latitude format and for the data to be project into WGS84. This section therefore works with POI data. It converts to longitude and latitude, subset POIs, exports to CSV for use in r5r (ADJUST PATH).
+
+```{r}
+# Convert the POIs dataframe to an sf object with lon and lat columns
+POIs_sf <- st_as_sf(POIs, coords = c("feature_easting", "feature_northing"), crs = 27700) %>% 
+  st_transform(.,27700)
+
+# Convert the Greenspaces dataframe into an sf object with centroid_lon and centroid_lat columns
+Greenspaces_sf <- st_as_sf(Greenspaces, coords = c("centroid_lon", "centroid_lat"), crs = 4326) %>% 
+  st_transform(.,27700)
+
+london_boundary <- london_boundary %>% 
+  st_transform(.,27700)
+
+# Perform the spatial intersection with POIs (in order to subset)
+joined_data <- st_intersection(POIs_sf, london_boundary)
+
+# Perform the spatial intersection with Greenspaces
+joined_data_green <- st_intersection(Greenspaces_sf, london_boundary) %>%
+  mutate(category = 'Greenspace')
+
+# Rename columns in 'joined_data_green' to match 'joined_data' - to use rbind, they need to have the same names and same number of columns
+# https://www.digitalocean.com/community/tutorials/rbind-function-r
+
+names(joined_data_green)[names(joined_data_green) %in% c("id", "function.", "LSOA21CD.x", "LSOA21NM.x")] <- 
+  c("ref_no", "name", "LSOA21CD", "LSOA21NM")
+
+# Combine both joined data
+combined_joined_data <- rbind(
+  joined_data[, c("ref_no", "name", "LSOA21CD","LSOA21NM","geometry","category")], 
+  joined_data_green[, c("ref_no", "name", "LSOA21CD","LSOA21NM","geometry","category")])
+
+combined_joined_data <- combined_joined_data %>% 
+  st_transform(., 4326)
+
+# Plot the map with points within the shapefile in green
+ggplot() +
+  geom_sf(data = combined_joined_data, color = "green") +
+  geom_sf(data = london_boundary, fill = "transparent", color = "black") +
+  labs(x = "Longitude", y = "Latitude") +
+  ggtitle("POIs and Greenspaces in London") +
+  theme_minimal()
+
+# Check the unique categories
+unique_categories <- unique(combined_joined_data$category)
+print(unique_categories)
+
+# make sure combined_joined_data is in WGS84, is subset, and has lat/lon points not northing/easting
+combined_joined_data
+```
+
+### Create the final POI CSV
+NOTE, r5r works well when you have one CSV where the opportunities are columns with binary markers. The below code accomplishes that.
+
+```{r}
+# Convert the sf object back to a dataframe
+combined_joined_data_df <- as.data.frame(combined_joined_data)
+
+# Extract the coordinates from the 'geometry' column
+coords <- st_coordinates(combined_joined_data$geometry)
+
+# Add the 'lon' and 'lat' columns to the data frame
+combined_joined_data_df$lon <- coords[, 'X']
+combined_joined_data_df$lat <- coords[, 'Y']
+
+# Remove the geometry column
+combined_joined_data_df$geometry <- NULL
+
+# Find the unique categories - so its easier to work with in r5r
+unique_categories <- unique(combined_joined_data_df$category)
+
+# Add a binary column for each unique category, this is for r5r to distinguish between different opportunities
+for(cat in unique_categories) {
+  combined_joined_data_df <- combined_joined_data_df %>%
+    mutate(!!paste0(cat) := ifelse(category == cat, 1, 0))}
+
+# Write to CSV
+write.csv(combined_joined_data_df, "YOUR_PATH_HERE/LondonPOIs.csv", row.names = FALSE)
+```
+
+
+### Getting LSOA centroids
+```{r}
+# Get LSOA centroids
+centroids <- st_centroid(st_geometry(london_boundary))
+
+# Transform the centroids to WGS84 (EPSG:4326)
+centroids <- st_transform(centroids, crs = 4326)
+
+# Add the centroid coordinates to the centroids data frame
+centroid_data <- cbind(london_boundary, centroid_lat = st_coordinates(centroids)[, 2], centroid_lon = st_coordinates(centroids)[, 1])
+
+# Drop the polygon column because we will not need it
+centroid_data <- centroid_data %>% 
+  st_drop_geometry("geometry")
+
+# Save LSOA centroid data to csv
+write.csv(centroid_data, file = "YOUR_PATH_HERE/LSOACentroids.csv")
+```
+
+# R5R Analysis
+This step is crucial. It should lead to the folder where all of the essential files for r5r are. These include the GTFS data, OSM network, origin/destination points csvs. This step establishes a dat file; if there is already one in the folder, it will use the cached one.
+
+```{r}
+r5r_core <- setup_r5(data_path = "YOUR_PATH_HERE/London_R5Rworkshop")
+```
+
+Below, it's important to ensure the POI point df is read in with easting and northing so it can be converted, even though it's currently called lon and lat.
+```{r}
+# Load the data
+LSOA_centroids <- fread(file.path("YOUR_PATH_HERE/LSOACentroids.csv")) # path to the LSOA centroids, origin points
+LSOA_centroids$lat <- LSOA_centroids$centroid_lat	
+LSOA_centroids$lon <- LSOA_centroids$centroid_lon	
+LSOA_centroids$id <- LSOA_centroids$V1	
+
+destpoints <- fread(file.path("YOUR_PATH_HERE/LondonPOIs.csv")) #path to POIs, destination points
+destpoints$id <- destpoints$ref_no
+```
+
+## PTAL Equivalent
+
+This section produces the data required for the PTAL equivalent. It takes SAPs (or public transport entry points) as the destinations. It first sets up a travel time matrix (ttm) then runs the accessibility() function. It takes 8.30 as the starting time to mirror PTAL's focus on rush hour. Further, it just uses walk time, like PTAL. It takes 35 minutes walk time as the absolute maximum. If someone was walking daily to public transport, anything longer than this would like compel them to drive. Unlike the subsequent sections, this one does not conduct sensitivity testing. This is partly due to the fact that the walk network is not susceptible to transport schedules and thus this version of the metric is not well suited to this version of sentitivity testing. However, it's comparison to PTAL in the dissertation serves as an alternative *rough* form of validation.
+
+```{r}
+
+# First we need to set up the travel time matrix
+ttm <- travel_time_matrix(r5r_core,
+                          origins = LSOA_centroids,
+                          destinations = destpoints,
+                          mode = "WALK",
+                          departure_datetime = as.POSIXct("25-05-2023 8:30:00", format = "%d-%m-%Y %H:%M:%S"),
+                          max_walk_time = 35,
+                          max_trip_duration = 35,
+                          time_window = 30,
+                          percentiles = 50,
+                          progress = TRUE)
+
+# BUT THIS IS ALSO PROBABLY WHY I GET SO MANY OUTLIERS WHEN I MAP, SO MAYBE DON'T DO THIS, SAY MAX IS 30 MINS.
+
+min_transport_time <- cost_to_closest(
+  ttm,
+  destpoints,
+  opportunity = "Transport",
+  travel_cost = "travel_time_p50",
+  n = 3) # This mirrors (no exactly) TfL's three-nearest principle
+
+# Calculate the accessibility count
+transport_access <- accessibility(r5r_core,
+                                origins = LSOA_centroids,
+                                destinations = destpoints,
+                                opportunities_colnames = c("Transport"),
+                                mode = "WALK",
+                                decay_function = "step",
+                                cutoffs = 20, # this puts a further limit on the ttm above
+                                departure_datetime = as.POSIXct("25-05-2023 8:30:00", format = "%d-%m-%Y %H:%M:%S"),
+                                max_walk_time = 20,
+                                time_window = 30,
+                                percentiles = 50,
+                                progress = TRUE)
+
+min_transport_time$id <- as.numeric(min_transport_time$id)
+transport_access$id <- as.numeric(transport_access$id)
+```
+
+Export the results as one csv
+
+```{r}
+LSOA_transport <- left_join(LSOA_centroids,min_transport_time)
+
+LSOA_transport <- left_join(LSOA_transport, transport_access)
+
+write.csv(LSOA_transport, file = "YOUR_PATH_HERE/r5r_access_data_transport.csv")
+```
+
+## Old Age and Access to Health Services
+
+See dissertation for logic behind these parametres selection.
+
+```{r}
+#setting up the modes
+mode <- c("WALK", "TRAM", "SUBWAY", "RAIL", "BUS")
+opportunity <- c("Health")
+max_walk_time <- 15 # in minutes
+travel_time_cutoff <- 30 # in minutes
+departure_datetime <- as.POSIXct("25-05-2023 10:00:00", format = "%d-%m-%Y %H:%M:%S") # - Older people might travel later in the day for appointments and such as to avoid rush hour, they are likely retired so they can do this
+time_window <- 30 # in minutes
+percentiles <- 50
+```
+
+Running the Main Query
+```{r}
+# JUST GET HEALTH SERVICES
+health_destpoints <- destpoints %>% filter(Health == 1)
+
+# CREATE A NEW TTM MATRIX FOR OLD AGE
+ttm_age <- travel_time_matrix(r5r_core,
+                            origins = LSOA_centroids,
+                            destinations = health_destpoints,
+                            mode = mode,
+                            departure_datetime = departure_datetime,
+                            max_walk_time = 15, 
+                            max_trip_duration = 35,
+                            time_window = 30,
+                            percentiles = 50,
+                            progress = TRUE)
+
+min_age_time <- cost_to_closest(
+  ttm_age,
+  health_destpoints,
+  opportunity = opportunity,
+  travel_cost = "travel_time_p50",
+  n = 3)
+
+age_access <- accessibility(r5r_core,
+                        origins = LSOA_centroids,
+                        destinations = health_destpoints,
+                        mode = mode,
+                        opportunities_colnames = opportunity,
+                        decay_function = "step",
+                        cutoffs = travel_time_cutoff,
+                        departure_datetime = departure_datetime,
+                        max_walk_time = max_walk_time,
+                        time_window = time_window,
+                        percentiles = percentiles,
+                        progress = TRUE)
+
+# Merge to make CSV
+min_age_time$id <- as.numeric(min_age_time$id)
+age_access$id <- as.numeric(age_access$id)
+
+LSOA_centroids_age <- LSOA_centroids
+
+LSOA_age <- left_join(LSOA_centroids_age,min_age_time)
+
+LSOA_age <- left_join(LSOA_age, age_access)
+
+write.csv(LSOA_age, file = "YOUR_PATH_HERE/access_age.csv")
+```
+
+###  Sensitivity Testing
+NOTES:
+1.) This is quite computationally expensive as well. Increase memory for r5r above if necessary.
+2.) The output of this was manually changed to correspond to the time of day.
+```{r}
+times <- seq(
+  from = as.POSIXct("2023-05-25 07:00:00"),
+  to = as.POSIXct("2023-05-25 20:00:00"),
+  by = "30 min")
+
+# Create an empty list to store the results
+results_list <- list()
+
+# Loop over the times
+for (i in seq_along(times)) {
+  # Set the conditions, same as above
+  mode <- c("WALK", "TRAM", "SUBWAY", "RAIL", "BUS") 
+  opportunity <- c("Health")
+  max_walk_time <- 15 # in minutes
+  travel_time_cutoff <- 30 # in minutes
+  departure_datetime <- as.POSIXct("25-05-2023 10:00:00", format = "%d-%m-%Y %H:%M:%S")
+  time_window <- 30 # in minutes
+  percentiles <- 50
+
+  # Print current time
+  print(paste0("Running for: ", times[i]))
+  
+  # Calculate the cost to closest
+  min_age_time <- cost_to_closest(
+    ttm_age,
+    destpoints,
+    opportunity = opportunity,
+    travel_cost = "travel_time_p50",
+    n = 3)
+
+  min_age_time$id <- as.numeric(min_age_time$id)
+
+  # Calculate the accessibility
+  age_access <- accessibility(r5r_core,
+                                    origins = LSOA_centroids,
+                                    destinations = destpoints,
+                                    opportunities_colnames = opportunity,
+                                    mode = mode,
+                                    decay_function = "step",
+                                    cutoffs = 30,
+                                    departure_datetime = times[i],
+                                    max_walk_time = max_walk_time,
+                                    time_window = time_window,
+                                    percentiles = percentiles,
+                                    progress = TRUE)
+
+  age_access$id <- as.numeric(age_access$id)
+
+  # Combine the results into a list
+  results_list[[i]] <- list("time" = times[i], "min_age_time" = min_age_time, "age_access" = age_access)}
+```
+
+### Loop through all the CSV files in that list and export them
+```{r}
+# Loop through the items in the list
+for (i in seq_along(results_list)) {
+  # Get the current item
+  item <- results_list[[i]]
+  
+  # Define the time string for the filenames
+  time_str <- format(item$time, "%H%M")
+
+  # Merge min_age_time and age_access dataframes with LSOA_centroids
+  LSOA_age <- left_join(LSOA_centroids, item$min_age_time)
+  LSOA_age <- left_join(LSOA_age, item$age_access)
+
+  # Save the merged DataFrame to a CSV file
+  write.csv(LSOA_age, 
+            paste0("YOUR_PATH_HERE/LSOA_age_", time_str, ".csv"), 
+            row.names = FALSE)}
+```
+
+
+## IMD and Access to All Services
+
+```{r}
+#setting up the modes
+mode <- c("WALK", "TRAM", "SUBWAY", "RAIL", "BUS")
+max_walk_time <- 30 # in minutes
+travel_time_cutoff <- 60 # in minutes
+departure_datetime <- as.POSIXct("25-05-2023 10:00:00", format = "%d-%m-%Y %H:%M:%S")
+time_window <- 30 # in minutes
+percentiles <- 50
+
+# Define the opportunity categories
+opportunities <- c("Attractions", "Eating", "Education", "Entertainment", "Government",
+                   "Grocery", "Health", "Infrustructure", "Organisations", "Retail", "Transport", "Greenspace")
+
+# Initialise an empty list to store results
+result_list <- list()
+
+# Loop over all the opportunities
+for(opportunity in opportunities) {
+  
+  opportunity_destpoints <- destpoints %>% filter_(paste(opportunity, "== 1"))
+  
+  ttm_opportunity <- travel_time_matrix(r5r_core,
+                                        origins = LSOA_centroids,
+                                        destinations = opportunity_destpoints,
+                                        mode = mode, 
+                                        departure_datetime = departure_datetime,
+                                        max_walk_time = 30,
+                                        max_trip_duration = 45,
+                                        time_window = 30,
+                                        percentiles = 50,
+                                        progress = TRUE)
+  
+  min_opportunity_time <- cost_to_closest(
+    ttm_opportunity,
+    destpoints,
+    opportunity = opportunity,
+    travel_cost = "travel_time_p50",
+    n = 3)
+  
+  access_opportunity <- accessibility(r5r_core,
+                                      origins = LSOA_centroids,
+                                      destinations = opportunity_destpoints,
+                                      mode = mode,
+                                      opportunities_colnames = c(opportunity),
+                                      decay_function = "step",
+                                      cutoffs = 45,
+                                      departure_datetime = departure_datetime,
+                                      max_walk_time = max_walk_time,
+                                      time_window = time_window,
+                                      percentiles = percentiles,
+                                      progress = TRUE)
+  
+  min_opportunity_time$id <- as.numeric(min_opportunity_time$id)
+  access_opportunity$id <- as.numeric(access_opportunity$id)
+  
+  LSOA_centroids_opportunity <- LSOA_centroids
+  
+  LSOA_opportunity <- left_join(LSOA_centroids_opportunity, min_opportunity_time)
+  LSOA_opportunity <- left_join(LSOA_opportunity, access_opportunity)
+  
+  # Store the result in the list
+  result_list[[opportunity]] <- LSOA_opportunity}
+
+# Combine all the results into a single dataframe
+final_df <- do.call(rbind, result_list)
+
+# Write the combined dataframe to a CSV
+write.csv(final_df, file = "YOUR_PATH_HERE/access_all.csv")
+```
+
+### Sensitivity Testing
+NOTES:
+1.) This is quite computationally expensive as well. Increase memory for r5r above if necessary. Or, if running all of the opportunities in one go is too much, they can be broken down so just a few are selected and run at a time.
+2.) The output of this was manually changed to correspond to the time of day.
+
+```{r}
+# Setting up the modes
+mode <- c("WALK", "TRAM", "SUBWAY", "RAIL", "BUS") 
+max_walk_time <- 30 # in minutes
+travel_time_cutoff <- 60 # in minutes
+departure_datetime <- as.POSIXct("25-05-2023 10:00:00", format = "%d-%m-%Y %H:%M:%S") 
+time_window <- 30 # in minutes
+percentiles <- 50
+
+# Define the opportunity categories
+ opportunities <- c("Attractions", "Eating", "Education", "Entertainment", "Government",
+                    "Grocery", "Health", "Infrustructure", "Organisations", "Retail", "Transport", "Greenspace")
+
+# Define the times I want to run the model for
+times <- seq(
+  from = as.POSIXct("2023-05-25 07:00:00"),
+  to = as.POSIXct("2023-05-25 20:00:00"),
+  by = "30 min")
+
+# Create an empty list to store the results
+results_list <- list()
+
+# Function to run sensitivity analysis for each opportunity
+run_sensitivity <- function(opportunity, times) {
+  opportunity_df_list <- list() # To store data frames for each time step
+  
+  for (i in seq_along(times)) {
+    # Print current time and opportunity
+    print(paste0("Running for: ", opportunity, " at time: ", times[i]))
+
+    opportunity_destpoints <- destpoints %>% filter_(paste(opportunity, "== 1"))
+  
+    ttm_opportunity <- travel_time_matrix(r5r_core,
+                                          origins = LSOA_centroids,
+                                          destinations = opportunity_destpoints,
+                                          mode = mode, 
+                                          departure_datetime = times[i],
+                                          max_walk_time = 30,
+                                          max_trip_duration = 45,
+                                          time_window = 30,
+                                          percentiles = 50,
+                                          progress = TRUE)
+
+    min_opportunity_time <- cost_to_closest(
+      ttm_opportunity,
+      destpoints,
+      opportunity = opportunity,
+      travel_cost = "travel_time_p50",
+      n = 3)
+  
+    access_opportunity <- accessibility(r5r_core,
+                                        origins = LSOA_centroids,
+                                        destinations = opportunity_destpoints,
+                                        mode = mode,
+                                        opportunities_colnames = c(opportunity),
+                                        decay_function = "step",
+                                        cutoffs = 45,
+                                        departure_datetime = times[i],
+                                        max_walk_time = max_walk_time,
+                                        time_window = time_window,
+                                        percentiles = percentiles,
+                                        progress = TRUE)
+  
+    min_opportunity_time$id <- as.numeric(min_opportunity_time$id)
+    access_opportunity$id <- as.numeric(access_opportunity$id)
+  
+    LSOA_centroids_opportunity <- LSOA_centroids
+    LSOA_opportunity <- left_join(LSOA_centroids_opportunity, min_opportunity_time)
+    LSOA_opportunity <- left_join(LSOA_opportunity, access_opportunity)
+
+    # Save the DataFrame to a list
+    opportunity_df_list[[i]] <- LSOA_opportunity
+    
+    # Define the time string for the filenames
+    time_str <- format(times[i], "%H%M")
+  
+    # Save the merged DataFrame to a CSV file
+    write.csv(LSOA_opportunity, 
+              paste0("YOUR_PATH_HERE/LSOA_", opportunity, "_", time_str, ".csv"), 
+              row.names = FALSE)}
+  
+  # Join all data frames together
+  joined_df <- do.call(rbind, opportunity_df_list)
+  
+  # Save the joined DataFrame to a CSV file
+  write.csv(joined_df,
+            paste0("YOUR_PATH_HERE/LSOA_", opportunity, "_all.csv"), # THIS NEEDS TO BE CHANGED
+            row.names = FALSE)
+  
+  # Return the joined DataFrame to be saved to the results list
+  return(joined_df)}
+
+# Run the Actual Sensitivity Testing
+
+# Loop over the opportunities
+for (opportunity in opportunities) {
+  results_list[[opportunity]] <- run_sensitivity(opportunity, times)}
+
+# Join all results together
+all_results <- do.call(rbind, results_list)
+
+# Save the all_results DataFrame to a CSV file
+write.csv(all_results,
+          "/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/r5r - Access Data/Dep_sensitivity/LSOA_imd_all.csv", 
+          row.names = FALSE)
+```
+
